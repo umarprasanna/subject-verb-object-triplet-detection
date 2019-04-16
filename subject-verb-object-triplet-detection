@@ -1,0 +1,594 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Wed May 16 13:26:01 2018
+
+@author: Prasanna Umar
+
+Functions for Subject-Verb-Object triplets from sentences
+
+Original Source: https://github.com/NSchrading/intro-spacy-nlp/blob/master/subject_object_extraction.py
+Modification:
+1) Passive voice detection
+2) Added modifiers' detection
+3) Added support for additional sentences
+
+"""
+# Getting Subject-Verb-Object triplets from sentences
+
+import spacy
+import string
+import re
+nlp = spacy.load('en')
+
+SUBJECTS = ["nsubj", "nsubjpass", "csubj", "csubjpass", "agent", "expl"]
+OBJECTS = ["dobj", "dative", "attr", "oprd", "pobj"] # pobj addition creates issues sometimes
+modifiers = ["nummod","num","amod","advmod","hmod","infmod","nn","nmod","npadvmod",\
+             "number","partmod","quantmod","poss","possessive","compound"]
+
+
+def getSubsFromConjunctions(subs):
+    moreSubs = []
+    for sub in subs:
+        # rights is a generator
+        rights = list(sub.rights)
+        rightDeps = {tok.lower_ for tok in rights}
+        if ("and" in rightDeps) or ("&" in rightDeps) or ("n" in rightDeps): #TODO customize for n and &
+            moreSubs.extend([tok for tok in rights if tok.dep_ in SUBJECTS or tok.pos_ in ["NOUN","PROPN","PRON"]])
+        # If longer sentence
+        #if ("," in rightDeps):
+            #moreSubs.extend([tok for tok in rights if tok.dep_ in SUBJECTS or tok.pos_ in ["NOUN","PROPN","PRON"]])
+            
+            #further_rights = list(moreSubs[0].rights)
+            #if len(further_rights) != 0:
+                #moreSubs.extend([tok for tok in further_rights if tok.dep_ in SUBJECTS or tok.pos_ in ["NOUN","PROPN","PRON"]])
+                
+
+            #if len(moreSubs) > 0:
+                #moreSubs.extend(getSubsFromConjunctions(moreSubs))
+    
+    return moreSubs
+    
+def getObjsFromConjunctions(objs):
+    moreObjs = []
+    for obj in objs:
+        # rights is a generator
+        rights = list(obj.rights)
+        rightDeps = {tok.lower_ for tok in rights}
+        if "and" in rightDeps:
+            moreObjs.extend([tok for tok in rights if tok.dep_ in OBJECTS or tok.pos_ in ["NOUN","PROPN"]])
+            if len(moreObjs) > 0:
+                moreObjs.extend(getObjsFromConjunctions(moreObjs))
+    return moreObjs
+
+def getVerbsFromConjunctions(verbs):
+    moreVerbs = []
+    for verb in verbs:
+        rightDeps = {tok.lower_ for tok in verb.rights}
+        if "and" in rightDeps or '&' in rightDeps:
+            moreVerbs.extend([tok for tok in verb.rights if tok.pos_ == "VERB"])
+            if len(moreVerbs) > 0:
+                moreVerbs.extend(getVerbsFromConjunctions(moreVerbs))
+    return moreVerbs
+
+def findSubs(tok):
+    if tok.dep_ != "xcomp":
+        head = tok.head
+        while head.pos_ != "VERB" and head.pos_ != "NOUN" and head.head != head:
+            head = head.head
+        if head.pos_ == "VERB":
+            subs = [tok for tok in head.lefts if tok.dep_ in SUBJECTS]
+            if len(subs) > 0:
+                subs.extend(getSubsFromConjunctions(subs))
+                return subs
+            elif head.head != head:
+                return findSubs(head)
+        elif head.pos_ == "NOUN":
+            return [head]
+    elif tok.dep_ == "xcomp":
+        head = tok.head
+        if head.pos_ == "VERB":
+            subs = [tok for tok in head.rights if tok.dep_ in OBJECTS and tok.pos_ in ["PROPN","PRON"]]
+            if len(subs) == 0:
+                subs = [tok for tok in head.lefts if tok.dep_ in SUBJECTS and tok.pos_ in ["PROPN","PRON"]]
+            return subs
+    
+    return []
+
+def isNegated(tok):
+    negations = {"no", "not", "n't", "never", "none"}
+    for dep in list(tok.lefts) + list(tok.rights):
+        if dep.lower_ in negations:
+            return True
+    return False
+
+def isPassive(tokens):
+    passive_sentence_indicator1 = [tok for tok in tokens if tok.dep_ == "auxpass"]
+
+    if len(passive_sentence_indicator1) > 0:
+        for tok in passive_sentence_indicator1:
+            head = tok.head
+            if head.tag_ == "VBN":
+                return True
+    return False
+
+def isnotAgent(tokens):
+    agent_present = [tok for tok in tokens if tok.dep_ == "agent"]
+    if len(agent_present) != 0:
+        return False
+    return True
+
+def findSVs(tokens):
+    svs = []
+    verbs = [tok for tok in tokens if tok.pos_ == "VERB"]
+    for v in verbs:
+        subs, verbNegated = getAllSubs(v)
+        if len(subs) > 0:
+            for sub in subs:
+                svs.append((sub.orth_, "!" + v.orth_ if verbNegated else v.orth_))
+    return svs
+
+def getObjsFromPrepositions(deps):
+    objs = []
+    
+    for dep in deps:
+        if dep.pos_ == "ADP" and dep.dep_ in ["prep","agent"]:
+            objs.extend([tok for tok in dep.rights if tok.dep_  in OBJECTS or (tok.pos_ == "PRON")])
+            
+    return objs
+
+def getObjsFromAttrs(deps):
+    for dep in deps:
+        if dep.pos_ == "NOUN" and dep.dep_ == "attr":
+            verbs = [tok for tok in dep.rights if tok.pos_ == "VERB"]
+            prep_in = [tok for tok in dep.rights if tok.tag_ == "IN"]
+            if len(verbs) > 0:
+                for v in verbs:
+                    rights = list(v.rights)
+                    objs = [tok for tok in rights if tok.dep_ in OBJECTS]
+                    objs.extend(getObjsFromPrepositions(rights))
+                    if len(objs) > 0:
+                        return v, objs
+            elif len(verbs)==0 and len(prep_in) > 0:
+                for p in prep_in:
+                    rights = list(p.rights)
+                    objs = [tok for tok in rights if tok.dep_ in OBJECTS]
+                    if len(objs) > 0:
+                        return None, objs
+                    
+    return None, None
+
+def getObjFromXComp(deps):
+    objs = []
+    for dep in deps:
+        if dep.pos_ == "VERB" and dep.dep_ == "xcomp":
+            v = dep
+            rights = list(v.rights)
+            if len(rights)>0:
+                objs = [tok for tok in rights if tok.dep_ in OBJECTS]
+                objs.extend(getObjsFromPrepositions(rights))
+            # For sentences like "I like swimming", "swimming is detected as verb
+            elif len(rights)==0 and dep.tag_ == "VBG":
+                objs = [tok for tok in deps if tok.tag_ == "VBG"] 
+            if len(objs) > 0:
+                return v, objs
+    return None, None
+
+def getObjFromObjs(deps):
+    objs = []
+    for dep in deps:
+        if dep.dep_ in ["dobj","acomp"]:
+            rights = list(dep.rights)
+            if len(rights)>0:
+                objs.extend(getObjsFromPrepositions(rights))
+            if len(objs) > 0:
+                
+                return objs
+    return None
+
+def getAcomp(v):
+    acomps = [tok for tok in v.rights if (tok.dep_ == "acomp")]
+    return acomps
+                                           
+def getXcomp(v):
+    xcomps = [tok for tok in v.rights if tok.dep_ == "xcomp"] 
+    return xcomps
+
+def getSubFromCcomp(dep):
+    tok = [token for token in dep if token.dep_ == "ccomp"]
+    if len(tok)>0:
+        tail = tok[0].children
+        sub = [tok for tok in tail if tok.pos_ in ["NOUN","PROPN","PRON"] and tok.dep_ in SUBJECTS]
+        return sub
+    return []
+        
+def getPossPronfromSubj(sub):
+    poss = [tok for tok in sub.lefts if ((sub.dep_ in SUBJECTS) and (tok.dep_ == "poss" or tok.dep_ == "possessive"))]
+    return poss
+
+def getPossPronfromObj(obj):
+    poss = [tok for tok in obj.lefts if ((obj.dep_ in OBJECTS) and (tok.dep_ == "poss" or tok.dep_ == "possessive"))]
+    return poss
+    
+def getCompoundObj(obj):
+    compdobj = [tok for tok in obj.lefts if obj.dep_ in OBJECTS and tok.dep_ == "compound"]
+    return compdobj
+
+def getCompoundSubj(sub):
+    compdsub = [tok for tok in sub.lefts if sub.dep_ in SUBJECTS and tok.dep_ == "compound"]
+    return compdsub
+
+def getSubmodifiers(sub):
+    submod = [tok for tok in sub.lefts if sub.dep_ in SUBJECTS and tok.dep_ in modifiers]
+    return submod
+
+def getObjmodifiers(obj):
+    objmod = [tok for tok in obj.lefts if obj.dep_ in OBJECTS and tok.dep_ in modifiers]
+    return objmod
+
+def getAllSubs(v):
+    verbNegated = isNegated(v)
+    subs = [tok for tok in v.lefts if ((tok.dep_ in SUBJECTS or tok.pos_ == "PRON") and (tok.pos_ != "DET"))]
+    if len(subs) > 0:
+        subs.extend(getSubsFromConjunctions(subs))
+    else:
+        foundSubs = findSubs(v)
+        subs.extend(foundSubs)
+    return subs, verbNegated
+
+def getAllObjs(v):
+    # rights is a generator
+    rights = list(v.rights)
+    objs = [tok for tok in rights if tok.dep_ in OBJECTS]
+    objs.extend(getObjsFromPrepositions(rights))
+    potentialNewVerb, potentialNewObjs = getObjFromXComp(rights)
+    if potentialNewObjs is not None and len(potentialNewObjs) > 0:
+        objs.extend(potentialNewObjs)
+        v = potentialNewVerb
+    objs.extend(getObjsFromConjunctions(objs))
+    #if len(getSubFromCcomp(rights))>0:
+        #objs.extend(getSubFromCcomp(rights))
+    #potentialNewVerb, potentialNewObjs = getObjsFromAttrs(rights)
+    #if potentialNewObjs is not None and len(potentialNewObjs) > 0:
+    #    objs.extend(potentialNewObjs)
+        
+    prep_objs = [obj for obj in objs if obj.dep_ == "pobj"]
+    if len(prep_objs)>0:
+        pass
+    else:
+        potentialNewObjs = getObjFromObjs(rights)
+        if potentialNewObjs is not None and len(potentialNewObjs) > 0:
+            objs.extend(potentialNewObjs)
+    
+    return v, objs
+
+def findSVOs(tokens):
+    svos = []
+    verbs = [tok for tok in tokens if tok.pos_ == "VERB" and tok.dep_ != "aux" and tok.dep_ != "auxpass" \
+            and tok.dep_ not in modifiers and tok.dep_ != "xcomp"]
+    #verbs = [tok for tok in tokens if tok.pos_ == "VERB" and tok.dep_ != "aux" and tok.dep_ == "ROOT"]
+    
+    passive = isPassive(tokens)
+    noagent = isnotAgent(tokens)
+    for v in verbs:
+        subs, verbNegated = getAllSubs(v)
+        # hopefully there are subs, if not, don't examine this verb any longer
+        if len(subs) > 0:
+            v, objs = getAllObjs(v)   
+            if not passive:
+                if len(objs) > 0:
+                
+                    for sub in subs:
+                        mod_sub = getSubmodifiers(sub)
+                        if len(mod_sub) > 0:
+                            sub = mod_sub[0].text + " " + sub.text
+                            
+                        elif len(mod_sub) == 0:
+                            sub = sub.text
+                            
+                        for obj in objs:
+                            objNegated = isNegated(obj)
+                            mod_obj = getObjmodifiers(obj)
+                            if len(mod_obj) > 0:
+                                obj = mod_obj[0].text + " " + obj.text
+                            
+                            elif len(mod_obj) == 0:
+                                obj = obj.text
+                            
+                            svos.append((sub,\
+                                         "!" + v.lower_ if verbNegated or objNegated else v.lower_, \
+                                         obj))
+                else:
+                    for sub in subs:
+                        mod_sub = getSubmodifiers(sub)
+                        if len(mod_sub) > 0:
+                            sub = mod_sub[0].text + " " + sub.text
+                            
+                        elif len(mod_sub) == 0:
+                            sub = sub.text
+                        acomps = getAcomp(v)
+                        if len(acomps) > 0:
+                            svos.append((sub,\
+                                         "!" + v.lower_ if verbNegated else v.lower_,\
+                                         acomps[0].lower_ ))
+                        else:
+                            svos.append((sub, "!" + v.lower_ if verbNegated else v.lower_,"Object_Not_Found" ))
+            else:
+                if len(objs) > 0:
+                
+                    for sub in subs:
+                        mod_sub = getSubmodifiers(sub)
+                        if len(mod_sub) > 0:
+                            sub = mod_sub[0].text + " " + sub.text
+                            
+                        elif len(mod_sub) == 0:
+                            sub = sub.text
+                        for obj in objs:
+                            objNegated = isNegated(obj)
+                            mod_obj = getObjmodifiers(obj)
+                            if len(mod_obj) > 0:
+                                obj = mod_obj[0].text + " " + obj.text
+                            
+                            elif len(mod_obj) == 0:
+                                obj = obj.text
+                            
+                            svos.append((obj, \
+                                         "!" + v.lower_ if verbNegated or objNegated else v.lower_, \
+                                         sub))
+                            
+                else:
+                    for sub in subs:
+                        mod_sub = getSubmodifiers(sub)
+                        if len(mod_sub) > 0:
+                            sub = mod_sub[0].text + " " + sub.text
+                            
+                        elif len(mod_sub) == 0:
+                            sub = sub.text
+                        
+                        
+                        acomps = getAcomp(v)
+                        xcomps = getXcomp(v)
+                        if len(acomps) > 0:
+                            svos.append((acomps[0].lower_, "!" + v.lower_ if verbNegated else v.lower_,\
+                                         sub ))
+                        elif noagent and len(xcomps)>0:
+                            
+                            svos.append(("Subject_Not_Found", \
+                                         "!" + xcomps[0].lower_ if verbNegated else xcomps[0].lower_,\
+                                         sub ))
+                        elif noagent and len(acomps) == 0:
+                            svos.append(("Subject_Not_Found", \
+                                         "!" + "!" + v.lower_ if verbNegated else v.lower_,\
+                                         sub ))                       
+    print(svos)
+    return svos
+
+def sentence_split(text):
+    """
+    returns the Parse Tree of a Sample
+    """
+    doc = nlp(text)
+    sentences = [sent.string.strip() for sent in doc.sents]   
+    return sentences
+
+
+    
+def clause_split(text):
+    """
+    returns the clauses in the sentence
+    """
+    text = str(text)
+    doc = nlp(text)
+    subord_conj = []
+    clauses = [text]
+    advclause_verb = [tok for tok in doc if tok.dep_ == "advcl" and tok.pos_ == "VERB"]
+    
+    if len(advclause_verb) > 0:
+        for advcls in advclause_verb:
+            subord_conj= [tok for tok in advcls.lefts if tok.dep_ == "mark"or tok.dep_ == "advmod"]
+            
+            list_tokens = str(doc).split(" ")
+            list_tokens = [''.join(c for c in s if c not in string.punctuation) for s in list_tokens]
+            
+            if len(subord_conj) > 0:
+                count = list_tokens.count(subord_conj[0].text)
+                if count == 1:
+                    adv_children = [child for child in advclause_verb[0].children]
+                    
+
+                    if subord_conj[0] in doc[0:3]:
+                        
+                        if list_tokens.count(adv_children[-1].text) >1:
+                            my_regex = r"\b" + re.escape(adv_children[-1].text) + r"\b"
+                            text_n = re.split(my_regex,text)
+                            
+                        else:
+                            my_regex = r"\b" + re.escape(adv_children[-1].text) + r"\b"
+                            text_n = re.split(my_regex,text)
+                            
+                        length = len(text_n)
+                        if length == 2:
+                            ntext = [text_n[0]+adv_children[-1].text,text_n[1]]
+                            return ntext
+                        else:
+                            ntext = [text_n[0]+adv_children[-1].text,", ".join(text_n[1:])]
+                            return ntext
+                        
+                        
+                        
+
+                    else:
+                        my_regex = r"\b" + re.escape(subord_conj[0].text) + r"\b"
+                        text_n = re.split(my_regex,text)
+                        
+                        
+                        length = len(text_n)
+                        if length == 2:
+                            ntext = [text_n[0],subord_conj[0].text+text_n[1]]
+                            return ntext
+                        else:
+                            ntext = [subord_conj[0].text + text_n[0],", ".join(text_n[1:])]
+                            return ntext
+                    
+                    return ntext
+            
+                elif count > 1:
+                    adv_children = [child for child in advclause_verb[0].children]
+                    
+                    if subord_conj[0] in doc[0:3]:
+                        my_regex = r"\b" + re.escape(adv_children[-1].text) + r"\b"
+                        ntext = re.split(my_regex,text)
+                        
+
+                    else:
+                        my_regex = r"\b" + re.escape(subord_conj[0].text) + r"\b"
+                        ntext = re.split(my_regex,text)
+                        
+                    return ntext
+                
+                else:
+                    
+                    return clauses
+            else:
+                
+                return clauses
+                
+    else:
+        return clauses
+    
+
+def testSVOs():
+    nlp = spacy.load('en')
+
+    tok = nlp("making $12 an hour? where am i going to go? i have no other financial assistance available and he certainly won't provide support.")
+    svos = findSVOs(tok)
+    print(svos)
+
+    tok = nlp("i don't have other assistance")
+    svos = findSVOs(tok)
+    print(svos)
+
+    print("-----------------------------------------------")
+    tok = nlp("They ate the pizza with anchovies.")
+    svos = findSVOs(tok)
+    print(svos)
+
+    print("--------------------------------------------------")
+    tok = nlp("I have no other financial assistance available and he certainly won't provide support.")
+    svos = findSVOs(tok)
+    print(svos)
+    
+
+    print("--------------------------------------------------")
+    tok = nlp("I have no other financial assistance available, and he certainly won't provide support.")
+    svos = findSVOs(tok)
+    print(svos)
+
+
+    print("--------------------------------------------------")
+    tok = nlp("he did not kill me")
+    svos = findSVOs(tok)
+    print(svos)
+    
+    print("--------------------------------------------------")
+    tok = nlp("he is an evil man who hurt my child and sister")
+    svos = findSVOs(tok)
+    print(svos)
+    
+
+    print("--------------------------------------------------")
+    tok = nlp("he told me i would die alone with nothing but my career someday")
+    svos = findSVOs(tok)
+    print(svos)
+
+    print("--------------------------------------------------")
+    tok = nlp("I wanted to kill him with a hammer.")
+    svos = findSVOs(tok)
+    print(svos)
+
+    print("--------------------------------------------------")
+    tok = nlp("because he hit me and also made me so angry i wanted to kill him with a hammer.")
+    svos = findSVOs(tok)
+    print(svos)
+
+    print("--------------------------------------------------")
+    tok = nlp("he and his brother shot me")
+    svos = findSVOs(tok)
+    print(svos)
+
+    print("--------------------------------------------------")
+    tok = nlp("he and his brother shot me and my sister")
+    svos = findSVOs(tok)
+    print(svos)
+
+    print("--------------------------------------------------")
+    tok = nlp("the annoying person that was my boyfriend hit me")
+    svos = findSVOs(tok)
+    print(svos)
+
+    print("--------------------------------------------------")
+    tok = nlp("the boy raced the girl who had a hat that had spots.")
+    svos = findSVOs(tok)
+    print(svos)
+
+    print("--------------------------------------------------")
+    tok = nlp("he spit on me")
+    svos = findSVOs(tok)
+    print(svos)
+
+    print("--------------------------------------------------")
+    tok = nlp("he didn't spit on me")
+    svos = findSVOs(tok)
+    print(svos)
+
+    print("--------------------------------------------------")
+    tok = nlp("the boy raced the girl who had a hat that didn't have spots.")
+    svos = findSVOs(tok)
+    print(svos)
+
+    print("--------------------------------------------------")
+    tok = nlp("he is a nice man that didn't hurt my child and sister")
+    svos = findSVOs(tok)
+    print(svos)
+
+    print("--------------------------------------------------")
+    tok = nlp("he didn't spit on me and my child")
+    svos = findSVOs(tok)
+    print(svos)
+
+    print("--------------------------------------------------")
+    tok = nlp("he beat and hurt me")
+    svos = findSVOs(tok)
+    print(svos)
+    
+    print("--------------------------------------------------")
+    tok = nlp("She was killed by John.")
+    svos = findSVOs(tok)
+    print(svos)
+    
+    print("--------------------------------------------------")
+    tok = nlp("I live in USA which is the most powerful country in the world.")
+    svos = findSVOs(tok)
+    print(svos)
+    
+    print("--------------------------------------------------")
+    tok = nlp("I am going to Las Vegas.")
+    svos = findSVOs(tok)
+    print(svos)
+    
+    print("--------------------------------------------------")
+    tok = nlp("It is hot here.")
+    svos = findSVOs(tok)
+    print(svos)
+    
+    print("--------------------------------------------------")
+    tok = nlp("I happen to live in Florida.")
+    svos = findSVOs(tok)
+    print(svos)
+    
+
+if __name__ == "__main__":
+    testSVOs()
+
+
+    
